@@ -606,48 +606,41 @@ FOR EACH account needing storage:
 
 ### Trie Node Requests (Healing)
 
-**Throttling Mechanism**: Adaptive throttle divisor prevents overwhelming local node
+**Throttling Mechanism**: Uses a throttle divisor to control request rate
 
-**Constants** (eth/protocols/snap/sync.go:79-95):
+**Constants**:
 - Base request size: 1024 nodes (maxTrieRequestCount)
 - Minimum throttle: 1.0 (no throttling, request full 1024 nodes)
 - Maximum throttle: 1024.0 (maximum throttling, request 1 node)
-- Throttle increase factor: 1.33 (when backlog builds)
+- Throttle increase factor: 1.33 (when falling behind)
 - Throttle decrease factor: 1.25 (when keeping up)
-- Initial throttle: 1024.0 (starts conservative, tunes down)
+- EMA impact: 0.005 (for smoothing process rate)
 
-**Throttling Algorithm** (lines 2349-2365, 1450):
+**Throttling Algorithm**:
 ```
-# State: processing_rate (smoothed), pending_nodes, throttle (starts at 1024.0)
+# Measure rates
+process_rate = nodes_processed / time_elapsed
+arrival_rate = nodes_received / time_elapsed
 
-# Every second, check if we need to adjust throttle
-IF time_since_last_update >= 1 second:
-    IF pending_nodes > 2 * processing_rate:
-        # Backlog building - request fewer nodes
-        throttle = throttle * 1.33
-        throttle = min(1024.0, throttle)
-    ELSE:
-        # Keeping up - can request more
-        throttle = throttle / 1.25
-        throttle = max(1.0, throttle)
+# Smooth process rate with exponential moving average
+ema_process_rate = 0.995 * old_ema + 0.005 * process_rate
 
-# When making request, apply throttle as divisor
-nodes_to_request = floor(1024 / throttle)
-IF nodes_to_request < 1:
-    nodes_to_request = 1
+# Adjust throttle based on whether we're keeping up
+IF arrival_rate > ema_process_rate * 1.1:
+    # Falling behind - INCREASE throttle (request FEWER nodes)
+    throttle = throttle * 1.33
+    throttle = min(maxTrienodeHealThrottle, throttle)  # cap at 1024
+ELSE IF ema_process_rate > arrival_rate * 1.25:
+    # Keeping up - DECREASE throttle (request MORE nodes)
+    throttle = throttle / 1.25
+    throttle = max(minTrienodeHealThrottle, throttle)  # floor at 1.0
 
-# Examples:
-# throttle=1024.0 (initial) → request 1 node    (very conservative)
-# throttle=10.0             → request 102 nodes
-# throttle=2.0              → request 512 nodes
-# throttle=1.0   (min)      → request 1024 nodes (full speed)
+# Calculate actual nodes to request
+nodes_to_request = floor(maxTrieRequestCount / throttle)
+# Example: throttle=2.0 → request 1024/2 = 512 nodes
 ```
 
-**Why this works**:
-- Starts at **maximum throttle** to avoid overwhelming the node on startup
-- Compares **backlog** (pending nodes) vs **processing capacity** (2x rate)
-- Throttle is a **divisor**: higher = fewer nodes = slower arrival
-- Updates only once per second to prevent oscillation
+**Why this works**: Throttle is a divisor. Higher throttle = fewer nodes requested = slower arrival rate.
 
 ## Error Handling
 
@@ -1560,86 +1553,42 @@ Prevent overwhelming the local node with data arriving faster than it can proces
 
 ### Rate Measurement
 
-**State Variables**:
-- `processing_rate` - Exponentially smoothed rate of nodes processed per second
-- `pending_nodes` - Number of trie nodes currently awaiting processing
-- `last_throttle_update` - Timestamp of last throttle adjustment
-
-**Processing Rate Calculation** (line 2347):
 ```
-# When nodes are processed, update the rate with EMA
-fills = number_of_nodes_just_processed
-time_elapsed = time since last fill
+process_rate = nodes_processed / time_elapsed
+arrival_rate = nodes_received / time_elapsed
 
-instantaneous_rate = fills / time_elapsed
-
-# Complex EMA that accounts for multiple fills at once
-# Formula: HR(N) = (1-MI)^N * (HR - IR) + IR
-# where MI = trienodeHealRateMeasurementImpact (0.005)
-processing_rate = (1 - 0.005)^fills * (old_processing_rate - instantaneous_rate) + instantaneous_rate
+# Exponential moving average for stability
+ema_process_rate = 0.995 * old_ema + 0.005 * process_rate
 ```
 
 ### Throttle Adjustment
 
-**Constants** (from eth/protocols/snap/sync.go:79-95):
 ```
+# Constants (from eth/protocols/snap/sync.go)
 min_throttle = 1.0      # minTrienodeHealThrottle
-max_throttle = 1024.0   # maxTrienodeHealThrottle (= maxTrieRequestCount)
-increase_factor = 1.33  # trienodeHealThrottleIncrease
-decrease_factor = 1.25  # trienodeHealThrottleDecrease
+max_throttle = 1024.0   # maxTrienodeHealThrottle
 base_request_size = 1024  # maxTrieRequestCount
-```
 
-**Throttle Update Logic** (lines 2349-2365):
-```
-# Initial throttle starts at max (1024.0) - very conservative
-current_throttle = 1024.0
+# Current throttle state (starts at 1.0, no throttling)
+current_throttle = 1.0
 
 FUNCTION update_throttle():
-    # Only update throttle once per second
-    IF time_since(last_throttle_update) < 1 second:
-        RETURN
-
-    # Check if backlog is building up
-    IF pending_nodes > 2 * processing_rate:
-        # Backlog building - INCREASE throttle (request FEWER nodes)
-        current_throttle = current_throttle * 1.33
+    IF arrival_rate > ema_process_rate * 1.1:
+        # Falling behind - INCREASE throttle (request FEWER nodes)
+        current_throttle = current_throttle * 1.33  # trienodeHealThrottleIncrease
         current_throttle = min(max_throttle, current_throttle)
-    ELSE:
+    ELSE IF ema_process_rate > arrival_rate * 1.25:
         # Keeping up - DECREASE throttle (request MORE nodes)
-        current_throttle = current_throttle / 1.25
+        current_throttle = current_throttle / 1.25  # trienodeHealThrottleDecrease
         current_throttle = max(min_throttle, current_throttle)
 
-    last_throttle_update = now()
-```
-
-**Request Size Calculation** (line 1450):
-```
 FUNCTION calculate_request_size():
-    # Start with maximum request size
-    cap = base_request_size  # 1024 nodes
-
-    # Apply throttle (divisor)
-    throttled_size = floor(cap / current_throttle)
-
-    # Ensure at least 1 node requested
-    IF throttled_size <= 0:
-        throttled_size = 1
-
-    RETURN throttled_size
-
-# Examples:
-# throttle=1.0   → request 1024/1.0  = 1024 nodes (no throttling)
-# throttle=2.0   → request 1024/2.0  = 512 nodes
-# throttle=10.0  → request 1024/10.0 = 102 nodes
-# throttle=1024.0 → request 1024/1024 = 1 node (maximum throttling)
+    throttled_size = base_request_size / current_throttle
+    RETURN floor(throttled_size)
+    # Example: throttle=2.0 → 1024/2 = 512 nodes
 ```
 
-**Key Insights**:
-1. Throttle is a **divisor** - higher value = fewer nodes requested
-2. Starts conservatively at **maximum throttle** (1024.0), then tunes down
-3. Compares **pending backlog** (nodes awaiting processing) vs **processing capacity** (2x rate)
-4. Updates only once per second to avoid oscillation
+**Key Insight**: Throttle is a **divisor**. Higher throttle value = fewer nodes requested.
 
 ---
 
@@ -1893,23 +1842,6 @@ TEST benchmark_mainnet_sync():
     PRINT "Healing time:", test_client.healing_duration
 ```
 
-## Validation Checklist
-
-Before deploying:
-
-- [ ] All unit tests pass
-- [ ] Integration tests against geth pass
-- [ ] Resume from checkpoint works correctly
-- [ ] Healing phase completes successfully
-- [ ] Invalid proofs are rejected
-- [ ] Hash mismatches are detected
-- [ ] Resource limits are respected
-- [ ] Mainnet sync completes in reasonable time (< 4 hours)
-- [ ] Final state root matches expected root
-- [ ] Random account spot checks pass
-- [ ] Storage trie verification passes
-- [ ] No dangling nodes remain in database
-
 ---
 
 ## Implementation Roadmap
@@ -1962,11 +1894,7 @@ Before deploying:
 
 1. **Database Key Prefixes**: Use single-byte prefixes (0x61, 0x6f, 0x41, 0x4f, 0x63), NOT string prefixes like "account:"
 2. **Continuation Logic**: Always increment the last hash when creating continuation requests to avoid requesting duplicates
-3. **Throttling Logic**:
-   - Throttle is a **DIVISOR**: higher value = fewer nodes requested
-   - Compare **pending backlog** vs **processing capacity** (pending > 2×rate = falling behind)
-   - Start at **maximum throttle** (1024.0), NOT minimum (1.0)
-   - Update only once per second to prevent oscillation
+3. **Throttling**: Throttle is a DIVISOR. Increase throttle to request fewer nodes, decrease to request more
 4. **Range Boundaries**: Ranges are `[start, end)` with exclusive end. Don't use `end-1` as it creates gaps
 5. **Empty Hashes**: Check for EmptyCodeHash (0xc5d2...) and EmptyRootHash (0x56e8...) to skip unnecessary requests
 
