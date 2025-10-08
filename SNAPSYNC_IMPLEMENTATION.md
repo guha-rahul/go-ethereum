@@ -170,14 +170,15 @@ Manages the healing phase:
 - `request_id` (uint64) - Unique identifier to match response
 - `state_root` (32 bytes) - Root hash of target state trie
 - `starting_hash` (32 bytes) - First account hash to include (inclusive)
-- `ending_hash` (32 bytes) - Last account hash boundary (exclusive)
+- `ending_hash` (32 bytes) - Last account hash to include (INCLUSIVE)
 - `response_bytes` (uint64) - Soft limit for response size (64 KB - 512 KB typical)
 
 **Request Semantics**:
 - Accounts returned should be in lexicographical order of their hashes
-- Hash range: [starting_hash, ending_hash)
+- Hash range: [starting_hash, ending_hash] - **BOTH ends inclusive**
 - Responder may return partial range if byte limit is reached
-- Empty range request (starting_hash >= ending_hash) is invalid
+- Empty range request (starting_hash > ending_hash) is invalid
+- Handler implementation: `eth/protocols/snap/handler.go:317` - breaks when `hash >= Limit` AFTER adding account
 
 #### AccountRange Response (0x01)
 
@@ -453,7 +454,7 @@ timeout_duration = max(
 **Phase 1: Structural Validation**
 - Response ID matches request ID
 - Accounts array size reasonable (< maximum)
-- All account hashes in requested range [starting_hash, ending_hash)
+- All account hashes in requested range [starting_hash, ending_hash] (inclusive)
 - Accounts sorted in strict lexicographical order by hash
 - No duplicate account hashes
 - Each account body is valid RLP
@@ -483,7 +484,7 @@ timeout_duration = max(
 **Phase 1: Structural Validation**
 - Response ID matches request
 - Number of slot arrays equals number of requested accounts
-- All slot hashes within requested range [starting_hash, ending_hash)
+- All slot hashes within requested range [starting_hash, ending_hash] (inclusive)
 - Slots sorted by hash within each account
 - No duplicate slot hashes within account
 - Each slot value is valid RLP
@@ -555,15 +556,15 @@ ELSE IF peer returns < 50% of limit:
 **Continuation Handling**:
 - If response contains accounts but is incomplete:
   - **CRITICAL**: Next starting_hash = increment(last_returned_account_hash)
-  - Create continuation request: [new_start, same_ending_hash)
+  - Create continuation request: [new_start, same_ending_hash]
   - Can use same or different peer
 
-**Why increment?** Ranges are `[start, end)` where start is inclusive. If you don't increment, you'll request the last account again, causing duplicates.
+**Why increment?** Ranges are `[start, end]` with both ends inclusive. If you don't increment, you'll request the last account again, causing duplicates.
 
 ### Storage Range Requests
 
 **Small Accounts** (estimated < 1000 slots):
-- Request full range: starting_hash = 0x00...00, ending_hash = 0xff...ff
+- Request full range: starting_hash = 0x00...00, ending_hash = 0xff...ff (covers all slots)
 - Batch multiple small accounts in single request (up to 10-20 accounts)
 
 **Large Accounts** (estimated > 1000 slots):
@@ -606,41 +607,7 @@ FOR EACH account needing storage:
 
 ### Trie Node Requests (Healing)
 
-**Throttling Mechanism**: Uses a throttle divisor to control request rate
-
-**Constants**:
-- Base request size: 1024 nodes (maxTrieRequestCount)
-- Minimum throttle: 1.0 (no throttling, request full 1024 nodes)
-- Maximum throttle: 1024.0 (maximum throttling, request 1 node)
-- Throttle increase factor: 1.33 (when falling behind)
-- Throttle decrease factor: 1.25 (when keeping up)
-- EMA impact: 0.005 (for smoothing process rate)
-
-**Throttling Algorithm**:
-```
-# Measure rates
-process_rate = nodes_processed / time_elapsed
-arrival_rate = nodes_received / time_elapsed
-
-# Smooth process rate with exponential moving average
-ema_process_rate = 0.995 * old_ema + 0.005 * process_rate
-
-# Adjust throttle based on whether we're keeping up
-IF arrival_rate > ema_process_rate * 1.1:
-    # Falling behind - INCREASE throttle (request FEWER nodes)
-    throttle = throttle * 1.33
-    throttle = min(maxTrienodeHealThrottle, throttle)  # cap at 1024
-ELSE IF ema_process_rate > arrival_rate * 1.25:
-    # Keeping up - DECREASE throttle (request MORE nodes)
-    throttle = throttle / 1.25
-    throttle = max(minTrienodeHealThrottle, throttle)  # floor at 1.0
-
-# Calculate actual nodes to request
-nodes_to_request = floor(maxTrieRequestCount / throttle)
-# Example: throttle=2.0 → request 1024/2 = 512 nodes
-```
-
-**Why this works**: Throttle is a divisor. Higher throttle = fewer nodes requested = slower arrival rate.
+**See detailed Throttling Algorithm section below** for complete throttle logic.
 
 ## Error Handling
 
@@ -714,165 +681,79 @@ ON partial_response(response):
 
 ### Sync Phase State
 
-**Main Loop Pseudocode**:
+**Main Loop**:
+
+**Implementation**: See `Sync()` in `eth/protocols/snap/sync.go:585-771`
+
+**Structure**:
 ```
-FUNCTION sync_phase(state_root):
-    load_or_create_account_tasks()
-
-    WHILE account_tasks_remaining():
-        clean_completed_tasks()
-
-        assign_account_requests()
-        assign_bytecode_requests()
-        assign_storage_requests()
-
-        event = WAIT_FOR_EVENT([
-            response_received,
-            request_timeout,
-            peer_joined,
-            peer_dropped,
-            cancellation_signal
-        ])
-
-        MATCH event:
-            CASE response_received:
-                validate_and_process_response(event.response)
-            CASE request_timeout:
-                handle_timeout(event.request)
-            CASE peer_joined:
-                # New peer available, try assigning tasks
-                continue
-            CASE peer_dropped:
-                revert_peer_requests(event.peer_id)
-            CASE cancellation_signal:
-                RETURN cancelled
-
-        save_progress_checkpoint()
-
-    RETURN sync_complete
+1. Load or create 16 account range tasks (lines 775-889)
+2. Loop until all tasks complete (line 685):
+   a. Clean completed tasks (lines 687-688): cleanAccountTasks(), cleanStorageTasks()
+   b. Exit if tasks empty AND healing done (line 689)
+   c. Assign requests to idle peers (lines 691-704)
+   d. Wait for events via select{} (lines 705-768)
+   e. Process responses or handle failures
+3. Enter healing phase when snapped=true
 ```
+
+**Key Functions**:
+- `assignAccountTasks()` - line 1020
+- `assignStorageTasks()` - line 1220
+- `assignBytecodeTasks()` - line 1140
+- `cleanAccountTasks()` - line 956
+- `processAccountResponse()` - line 1885
 
 **Task Assignment**:
-```
-FUNCTION assign_account_requests():
-    FOR EACH task in account_tasks:
-        IF task.assigned OR task.completed:
-            CONTINUE
 
-        peer = select_best_peer(REQUEST_TYPE_ACCOUNT)
-        IF peer == NULL:
-            BREAK  # No available peers
+**Implementation**: See `assignAccountTasks()` in `eth/protocols/snap/sync.go:1020-1114`
 
-        request = CREATE_REQUEST(
-            id = generate_request_id(),
-            state_root = current_state_root,
-            starting_hash = task.next_hash,
-            ending_hash = task.last_hash,
-            response_bytes = calculate_byte_limit(peer)
-        )
+**Algorithm**:
+1. Sort idle peers by capacity (lines 1025-1040)
+2. For each task without active request (line 1045: `task.req == nil && task.res == nil`)
+3. Match task to highest-capacity idle peer
+4. Create request with:
+   - `origin = task.Next` (line 1082) - **CRITICAL**: advances on each response
+   - `limit = task.Last` (line 1083)
+   - `bytes = min(peer_capacity, maxRequestSize)` (line 1099)
+5. Send GetAccountRange request (line 1109)
+6. Set timeout based on peer RTT (lines 1086-1090)
 
-        send_get_account_range(peer, request)
-        mark_task_assigned(task, request)
-        mark_peer_busy(peer, REQUEST_TYPE_ACCOUNT)
-        start_timeout_timer(request, peer)
-```
+**Note**: Completed tasks (`task.done == true`) are removed by `cleanAccountTasks()` before assignment.
 
 **Response Processing**:
-```
-FUNCTION process_account_response(response):
-    request = find_request(response.request_id)
-    task = request.task
 
-    # Validate
-    IF NOT validate_account_response(response):
-        reject_and_revert(response, request)
-        RETURN
+**Implementation**: See `processAccountResponse()` in `eth/protocols/snap/sync.go:1885-2490`
 
-    # Store accounts
-    FOR EACH account in response.accounts:
-        write_account_to_db(account.hash, account.body)
-        generate_trie_nodes(account)
+**Key Concepts**:
+1. **Overflow trimming** (lines 1890-1907): Trim accounts beyond `task.Last`
+2. **Requirement tracking** (lines 1910-1968): Identify which accounts need code/storage
+3. **Storage task creation** (lines 2030-2208): Create storage subtasks for large contracts
+4. **Account storage** (lines 2440-2462): Write accounts to database, generate trie nodes
+5. **Task advancement** (lines 2465-2477):
+   - `task.Next` advances via `incHash()` as accounts complete
+   - `task.done = !res.cont` marks task completion
+   - Completed tasks removed by `cleanAccountTasks()`
 
-        IF account.code_hash != EMPTY_CODE_HASH:
-            task.pending_codes.add(account.code_hash)
-
-        IF account.storage_root != EMPTY_STORAGE_ROOT:
-            create_storage_task(account.hash, account.storage_root)
-
-    # Check if task complete
-    IF len(response.accounts) == 0:
-        # Empty response means range is complete (no accounts in range)
-        mark_task_completed(task)
-    ELSE:
-        last_received_hash = response.accounts[-1].hash
-
-        # Check if we've reached or passed the end of the range
-        IF last_received_hash >= task.last_hash:
-            mark_task_completed(task)
-        ELSE:
-            # Partial response - need continuation
-            # CRITICAL: Start next request at last_hash + 1 to avoid duplicates
-            continuation_start = increment_hash(last_received_hash)
-            create_continuation_task(continuation_start, task.last_hash)
-
-    mark_peer_idle(request.peer_id, REQUEST_TYPE_ACCOUNT)
-    update_progress_counters(response)
-```
+**Critical**: Tasks are **NOT recreated** for continuation. The same task is reassigned with `task.Next` as the new origin.
 
 ### Healing Phase State
 
-**Healing Loop**:
-```
-FUNCTION healing_phase():
-    initialize_trie_sync_scheduler(state_root)
+**Healing Phase**:
 
-    WHILE healing_incomplete():
-        missing_nodes = trie_sync_scheduler.missing()
-        missing_codes = collect_missing_bytecodes()
+**Implementation**: Integrated into main sync loop after `snapped=true`
 
-        IF len(missing_nodes) == 0 AND len(missing_codes) == 0:
-            RETURN healing_complete
+**Trie Node Healing**: See `assignTrienodeHealTasks()` in `eth/protocols/snap/sync.go:1377-1477`
+- Uses `trie.Sync` scheduler to track missing nodes (line 1379)
+- Throttles request size based on processing rate (line 1409)
+- Converts node requests to path sets (lines 1460-1473)
+- See Throttling Algorithm section for throttle details
 
-        assign_trie_node_requests(missing_nodes)
-        assign_bytecode_heal_requests(missing_codes)
+**Bytecode Healing**: See `assignBytecodeHealTasks()` in `eth/protocols/snap/sync.go:1505-1583`
+- Scans for missing bytecodes (via `trie.Sync`)
+- Batches code hash requests
 
-        event = WAIT_FOR_EVENT([
-            heal_response_received,
-            heal_request_timeout,
-            cancellation_signal
-        ])
-
-        MATCH event:
-            CASE heal_response_received:
-                process_heal_response(event.response)
-                update_trie_sync_scheduler(event.response)
-            CASE heal_request_timeout:
-                handle_heal_timeout(event.request)
-            CASE cancellation_signal:
-                RETURN cancelled
-```
-
-**Trie Node Healing**:
-```
-FUNCTION assign_trie_node_requests(missing_nodes):
-    throttled_batch_size = calculate_throttle()
-
-    FOR EACH peer in idle_peers(REQUEST_TYPE_TRIENODE):
-        batch = missing_nodes.take(throttled_batch_size)
-        IF len(batch) == 0:
-            BREAK
-
-        request = CREATE_REQUEST(
-            id = generate_request_id(),
-            state_root = current_state_root,
-            paths = convert_to_path_sets(batch),
-            response_bytes = 512 KB
-        )
-
-        send_get_trie_nodes(peer, request)
-        track_request(request)
-        start_timeout_timer(request, peer)
-```
+**Completion**: Loop exits when `len(tasks)==0 && healer.scheduler.Pending()==0` (line 689)
 
 ---
 
@@ -905,13 +786,15 @@ value = rlp_encoded_node
 
 *Account trie nodes*:
 ```
-key = "account_path:" || path_from_root
+key = 0x41 || hex_path
+     ("A" prefix + variable hex-encoded path from root)
 value = rlp_encoded_node
 ```
 
 *Storage trie nodes*:
 ```
-key = "storage_path:" || account_hash || path_from_root
+key = 0x4f || account_hash || hex_path
+     ("O" prefix + 32 bytes account hash + variable hex path)
 value = rlp_encoded_node
 ```
 
@@ -992,136 +875,57 @@ value = JSON({
 
 ## Trie Generation
 
+**Implementation**: `eth/protocols/snap/gentrie.go`
+
 ### Overview
 
-As accounts and storage slots are downloaded, the client must reconstruct the merkle patricia trie incrementally. This is done using a "stack trie" - a memory-efficient data structure that generates trie nodes on-the-fly.
+As accounts and storage slots are downloaded, the client must reconstruct the merkle patricia trie incrementally using a "stack trie" - a memory-efficient data structure that generates trie nodes on-the-fly.
 
-### Stack Trie Algorithm
+**Key Properties**:
+- Inserts keys in sorted order
+- Generates nodes as soon as possible
+- Keeps only current "stack" in memory (O(depth) space)
+- Emits nodes via callback for immediate persistence
 
-**Concept**:
-- Insert keys in sorted order
-- Generate nodes as soon as possible
-- Emit nodes to callback
-- Keep only current "stack" in memory (O(depth) space)
+### Path Scheme Trie Generation
 
-**Basic Operation**:
-```
-FUNCTION stack_trie_insert(key, value):
-    WHILE stack not empty AND key not descendant of stack.top:
-        node = stack.pop()
-        emit_node(node.path, node.hash, node.rlp)
+**Implementation**: `pathTrie` struct in `gentrie.go:46-293`
 
-    create_leaf(key, value)
-    push_to_stack(leaf)
-```
+**Constructor**: `newPathTrie()` at line 61
+- Parameters: owner hash, skipLeftBoundary flag, database reader, write batch
+- Used for both account tries and storage tries
 
-### Boundary Filtering (Path Scheme)
+**Key Methods**:
+- `update()` (line 69): Insert key-value pair into trie
+- `commit()` (line 93): Finalize trie, returns root hash or nil
+- `onTrieNode()` (line 115): Callback for each generated node
 
-**Problem**: Nodes at range boundaries may be incomplete.
+**Boundary Filtering** (lines 115-190):
+- **Problem**: Range boundaries may have incomplete nodes
+- **Left boundary**: Skips nodes on path to first inserted item (lines 120-146)
+- **Right boundary**: Deletes nodes on incomplete commit (lines 99-106)
+- **Inner path cleanup**: Removes dangling nodes between extension nodes (lines 152-168)
 
-**Left Boundary**:
-- First inserted item defines left boundary
-- Nodes on path from root to first item are incomplete
-- Must filter out left boundary nodes
-
-**Right Boundary**:
-- Last inserted item defines right boundary
-- When range is incomplete, right boundary nodes are incomplete
-- Must filter out right boundary nodes
-
-**Algorithm**:
-```
-FUNCTION on_trie_node(path, hash, blob):
-    # Left boundary filtering
-    IF skip_left_boundary AND (first_path == NULL OR path is_prefix_of first_path):
-        IF first_path == NULL:
-            first_path = path
-            # Clean up leftover nodes on left boundary
-            FOR i FROM 0 TO len(path):
-                delete_node_at_path(path[0:i])
-        RETURN  # Skip this node
-
-    # Extension node inner path cleanup
-    IF last_path != NULL AND last_path starts_with path AND len(last_path) - len(path) > 1:
-        # This is an extension node covering inner path
-        FOR i FROM len(path)+1 TO len(last_path):
-            delete_node_at_path(last_path[0:i])
-
-    # Write the node
-    write_node_to_database(path, blob)
-    last_path = path
-```
-
-**Commit Behavior**:
-```
-FUNCTION commit(complete_flag):
-    IF complete_flag:
-        # Flush remaining nodes
-        root_hash = stack_trie.hash()
-        RETURN root_hash
-    ELSE:
-        # Discard right boundary
-        FOR i FROM 0 TO len(last_path):
-            delete_node_at_path(last_path[0:i])
-        RETURN null
-```
-
-### Dangling Node Cleanup
-
-**Problem**: Interrupted syncs leave "dangling" nodes in database.
-
-**Types of Dangling Nodes**:
-
-1. **Outer dangling nodes**: On path from root to first/last inserted item
-2. **Inner dangling nodes**: Between extension node and its child
-
-**Cleanup Strategy**:
-
-*Left boundary cleanup* (when first node committed):
-```
-FOR i FROM 0 TO len(first_committed_path):
-    path_prefix = first_committed_path[0:i]
-    IF node_exists(path_prefix):
-        delete_node(path_prefix)
-```
-
-*Right boundary cleanup* (when incomplete commit):
-```
-FOR i FROM 0 TO len(last_committed_path):
-    path_prefix = last_committed_path[0:i]
-    IF node_exists(path_prefix):
-        delete_node(path_prefix)
-```
-
-*Inner path cleanup* (when extension node detected):
-```
-IF current_node_path is_prefix_of last_node_path:
-    # Extension node detected
-    FOR i FROM len(current_node_path)+1 TO len(last_node_path)-1:
-        inner_path = last_node_path[0:i]
-        IF node_exists(inner_path):
-            delete_node(inner_path)
-```
+**Dangling Node Cleanup**:
+- Left boundary cleanup: lines 125-145 (delete prefixes of first path)
+- Right boundary cleanup: lines 99-106 (delete prefixes of last path)
+- Inner path cleanup: lines 152-168 (delete inner extension node paths)
 
 ### Hash Scheme Trie Generation
 
-Simpler approach for hash scheme:
+**Implementation**: `hashTrie` struct in `gentrie.go:295-334`
 
-```
-FUNCTION hash_scheme_on_trie_node(path, hash, blob):
-    write_node_by_hash(hash, blob)
-    # No boundary filtering
-    # No dangling node cleanup
-```
+**Constructor**: `newHashTrie()` at line 300
+- Simpler than path scheme - no boundary handling needed
 
-**Commit**:
-```
-FUNCTION hash_scheme_commit(complete_flag):
-    IF complete_flag:
-        RETURN stack_trie.hash()
-    ELSE:
-        RETURN null
-```
+**Key Difference**:
+- No boundary filtering (nodes referenced by hash, not path)
+- No dangling node cleanup required
+- Direct write to database using node hash as key
+
+**Methods**:
+- `update()` (line 304): Insert key-value pair
+- `commit()` (line 308): Returns root hash, no cleanup needed
 
 ## Database Operations
 
@@ -1371,19 +1175,20 @@ FOR i FROM 0 TO chunk_count-1:
 
     IF i == chunk_count-1:
         # Last chunk: use max hash to cover everything
-        end_hash = 0xff...ff  # All 256 bits set to 1
+        end_hash = 0xff...ff  # All 256 bits set to 1 (MaxHash)
     ELSE:
-        # Regular chunk: next chunk's start is our end (exclusive)
-        end_hash = (i+1) * chunk_size
+        # Regular chunk: next chunk's start minus 1 is our end (inclusive)
+        end_hash = (i+1) * chunk_size - 1
 
     create_task(start_hash, end_hash)
-    # Task range is [start_hash, end_hash) - start inclusive, end exclusive
+    # Task range is [start_hash, end_hash] - BOTH inclusive
+    # See: hashRange.End() in eth/protocols/snap/range.go:66-72
 ```
 
-**Important**: Ranges use half-open intervals `[start, end)` where:
-- `start` is inclusive (included in range)
-- `end` is exclusive (NOT included in range)
-- This prevents gaps and overlaps between adjacent ranges
+**Important**: Ranges use **closed intervals** `[start, end]` where:
+- BOTH `start` and `end` are inclusive (both included in range)
+- Adjacent ranges are contiguous: range[i].end + 1 = range[i+1].start
+- Last range has end = MaxHash (0xff...ff)
 
 ### Range Operations
 
@@ -1401,194 +1206,109 @@ FUNCTION increment_hash(hash):
 **Hash Range Check**:
 ```
 FUNCTION hash_in_range(hash, start, end):
-    RETURN start <= hash AND hash < end
+    RETURN start <= hash AND hash <= end
 ```
 
 ## Merkle Proof Verification
 
+**Implementation**: `VerifyRangeProof()` in `trie/proof.go:478`
+
 ### Account Range Proof
 
-**Proof Structure**:
-- Array of RLP-encoded trie nodes
-- Contains nodes from root to first and last accounts in range
-- May contain additional nodes to prove absence of accounts
+**See**: `trie/proof.go:478-542` for complete verification algorithm
 
-**Verification Algorithm**:
-```
-FUNCTION verify_account_range_proof(proof, accounts, state_root, start_hash, end_hash):
-    # Build trie from proof
-    trie = construct_trie_from_proof(proof)
+**Key Verification Steps**:
+1. **Root verification**: Reconstruct trie from proof nodes, verify root matches state root
+2. **Key presence**: All returned accounts must be provable in the reconstructed trie
+3. **Range completeness**: Proof must demonstrate no accounts exist between last returned account and range end
+4. **Edge cases**: Empty ranges must prove absence of any accounts in range
 
-    IF trie.root() != state_root:
-        RETURN error("Proof root doesn't match state root")
-
-    # Verify each account exists in proof
-    FOR EACH account in accounts:
-        IF NOT trie.can_prove(account.hash, account.body):
-            RETURN error("Account not proven")
-
-    # Verify no additional accounts exist in range
-    IF len(accounts) > 0:
-        last_hash = accounts[-1].hash
-        IF last_hash < end_hash:
-            # Proof must show no accounts exist between last_hash and end_hash
-            IF NOT trie.proves_absence(last_hash + 1, end_hash):
-                RETURN error("Incomplete range not proven")
-    ELSE:
-        # Empty range - proof must show no accounts in [start_hash, end_hash)
-        IF NOT trie.proves_absence(start_hash, end_hash):
-            RETURN error("Empty range not proven")
-
-    RETURN success
-```
-
-**Proving Absence**:
-```
-FUNCTION proves_absence(trie, start_hash, end_hash):
-    # Find the nodes that would contain accounts in this range
-    left_node = trie.find_closest_node(start_hash)
-    right_node = trie.find_closest_node(end_hash)
-
-    # If they're the same node and it's proven, range is empty
-    IF left_node == right_node AND left_node in proof:
-        IF left_node.next_hash >= end_hash:
-            RETURN true
-
-    # Otherwise need to verify the gap
-    RETURN verify_gap(trie, start_hash, end_hash)
-```
+**Usage in snapsync**: Called in `processAccountResponse()` at `eth/protocols/snap/sync.go:1908`
 
 ### Storage Range Proof
 
-Similar to account proof but validated against account's storage_root:
+**See**: Same `VerifyRangeProof()` function, but verified against account's `storage_root`
 
-```
-FUNCTION verify_storage_range_proof(proof, slots, storage_root, account_hash, start_hash, end_hash):
-    trie = construct_trie_from_proof(proof)
+**Differences from account proof**:
+- Root is account's `storage_root` instead of state root
+- Keys are storage slot hashes
+- Values are RLP-encoded slot values
 
-    IF trie.root() != storage_root:
-        RETURN error("Proof root doesn't match storage root")
-
-    FOR EACH slot in slots:
-        IF NOT trie.can_prove(slot.hash, slot.value):
-            RETURN error("Slot not proven")
-
-    # Similar absence proof as accounts
-    IF len(slots) > 0 AND slots[-1].hash < end_hash:
-        IF NOT trie.proves_absence(slots[-1].hash + 1, end_hash):
-            RETURN error("Incomplete range not proven")
-
-    RETURN success
-```
+**Usage in snapsync**: Called in `processStorageResponse()` at `eth/protocols/snap/sync.go:2068`
 
 ## Healing Scheduler
 
 ### Trie Sync Scheduler
 
-**Purpose**: Track missing trie nodes and schedule their retrieval.
+**Implementation**: Uses `trie.Sync` from `trie/sync.go`
 
-**State**:
-- Set of missing nodes (path, hash) pairs
-- Set of pending requests
-- Dependency graph (parent-child relationships)
+**Purpose**: Track missing trie nodes and schedule their retrieval using dependency-aware scheduling.
 
-**Algorithm**:
-```
-FUNCTION initialize_trie_sync(root_hash):
-    scheduler.add_missing(path=[], hash=root_hash)
+**Initialization**: See `trie.NewSync()` in `trie/sync.go:74`
+- Starts with root node as missing
+- Builds dependency graph as nodes are processed
+- Tracks pending requests and missing nodes
 
-FUNCTION get_next_nodes_to_request(count):
-    # Select nodes with no pending dependencies
-    nodes = []
-    FOR EACH (path, hash) in missing_nodes:
-        IF NOT has_pending_parent(path):
-            nodes.append((path, hash))
-            IF len(nodes) >= count:
-                BREAK
-    RETURN nodes
+**Key Methods**:
+- `AddSubTrie()` - Add a trie root to track (line 89)
+- `AddCodeEntry()` - Add bytecode to track (line 99)
+- `Missing()` - Get count of missing nodes (line 195)
+- `Commit()` - Persist processed nodes to database (line 297)
 
-FUNCTION on_node_received(path, hash, blob):
-    # Remove from missing
-    scheduler.remove_missing(path, hash)
-
-    # Decode node and check for children
-    node = decode_trie_node(blob)
-    FOR EACH (child_path, child_hash) in node.children():
-        IF NOT db.has_node(child_path, child_hash):
-            scheduler.add_missing(child_path, child_hash)
-
-FUNCTION pending_count():
-    RETURN len(missing_nodes)
-```
+**Usage in snapsync**:
+- Initialized in `healTask` at `eth/protocols/snap/sync.go:450`
+- Accessed via `healer.scheduler` throughout healing phase
+- Node retrieval in `assignTrienodeHealTasks()` at line 1379
 
 ### Bytecode Healing
 
-Simpler than trie healing - just a set:
+**Implementation**: Integrated into same `trie.Sync` scheduler
 
-```
-FUNCTION initialize_bytecode_healing():
-    missing_codes = set()
+**Tracking**: See `trie.Sync.AddCodeEntry()` in `trie/sync.go:99`
+- Maintains set of missing code hashes
+- Simpler than trie healing (no dependencies)
+- Just needs to fetch and verify hash matches
 
-    # Scan all accounts for missing codes
-    FOR EACH account in database:
-        IF account.code_hash != EMPTY_CODE_HASH:
-            IF NOT db.has_code(account.code_hash):
-                missing_codes.add(account.code_hash)
-
-    RETURN missing_codes
-
-FUNCTION get_next_codes_to_request(count):
-    RETURN missing_codes.take(count)
-
-FUNCTION on_code_received(code_hash, code):
-    missing_codes.remove(code_hash)
-    db.write_code(code_hash, code)
-```
+**Usage in snapsync**: `assignBytecodeHealTasks()` at `eth/protocols/snap/sync.go:1505-1583`
 
 ## Throttling Algorithm
 
 ### Purpose
 
-Prevent overwhelming the local node with data arriving faster than it can process.
+Prevent overwhelming the local node with trie node data arriving faster than it can process during healing phase.
 
-### Rate Measurement
+### Implementation
 
-```
-process_rate = nodes_processed / time_elapsed
-arrival_rate = nodes_received / time_elapsed
+**See**: `processTrienodeHealResponse()` in `eth/protocols/snap/sync.go:2320-2366`
 
-# Exponential moving average for stability
-ema_process_rate = 0.995 * old_ema + 0.005 * process_rate
-```
+**Constants** (lines 74-95):
+- `trienodeHealRateMeasurementImpact = 0.005` - EMA smoothing factor
+- `minTrienodeHealThrottle = 1` - Minimum throttle divisor
+- `maxTrienodeHealThrottle = 1024` - Maximum throttle divisor
+- `trienodeHealThrottleIncrease = 1.33` - Multiplier when overloaded
+- `trienodeHealThrottleDecrease = 1.25` - Divisor when keeping up
+- `maxTrieRequestCount = 1024` - Base request size
 
-### Throttle Adjustment
+**Initial State** (line 540):
+- Throttle starts at `maxTrienodeHealThrottle` (1024.0) - conservative start
 
-```
-# Constants (from eth/protocols/snap/sync.go)
-min_throttle = 1.0      # minTrienodeHealThrottle
-max_throttle = 1024.0   # maxTrienodeHealThrottle
-base_request_size = 1024  # maxTrieRequestCount
+**Rate Tracking** (lines 2320-2347):
+- Uses exponential moving average (EMA) of processing rate
+- Formula: `HR(N) = (1-MI)^N*(OR-NR) + NR` (geometric sequence)
+- Tracks `trienodeHealRate` - nodes processed per second
 
-# Current throttle state (starts at 1.0, no throttling)
-current_throttle = 1.0
+**Throttle Adjustment** (lines 2349-2365):
+- Runs every 1 second
+- If `pending_nodes > 2 * processing_rate`: multiply throttle by 1.33 (request fewer)
+- Otherwise: divide throttle by 1.25 (request more)
+- Clamp between 1 and 1024
 
-FUNCTION update_throttle():
-    IF arrival_rate > ema_process_rate * 1.1:
-        # Falling behind - INCREASE throttle (request FEWER nodes)
-        current_throttle = current_throttle * 1.33  # trienodeHealThrottleIncrease
-        current_throttle = min(max_throttle, current_throttle)
-    ELSE IF ema_process_rate > arrival_rate * 1.25:
-        # Keeping up - DECREASE throttle (request MORE nodes)
-        current_throttle = current_throttle / 1.25  # trienodeHealThrottleDecrease
-        current_throttle = max(min_throttle, current_throttle)
+**Request Sizing** (line 1450 in `assignTrienodeHealTasks()`):
+- `request_size = maxTrieRequestCount / throttle`
+- Example: throttle=2.0 → 1024/2 = 512 nodes
+- Higher throttle = fewer nodes requested = less load
 
-FUNCTION calculate_request_size():
-    throttled_size = base_request_size / current_throttle
-    RETURN floor(throttled_size)
-    # Example: throttle=2.0 → 1024/2 = 512 nodes
-```
-
-**Key Insight**: Throttle is a **divisor**. Higher throttle value = fewer nodes requested.
+**Key Insight**: Throttle is a **divisor**. Higher value = smaller requests.
 
 ---
 
@@ -1895,7 +1615,7 @@ TEST benchmark_mainnet_sync():
 1. **Database Key Prefixes**: Use single-byte prefixes (0x61, 0x6f, 0x41, 0x4f, 0x63), NOT string prefixes like "account:"
 2. **Continuation Logic**: Always increment the last hash when creating continuation requests to avoid requesting duplicates
 3. **Throttling**: Throttle is a DIVISOR. Increase throttle to request fewer nodes, decrease to request more
-4. **Range Boundaries**: Ranges are `[start, end)` with exclusive end. Don't use `end-1` as it creates gaps
+4. **Range Boundaries**: Ranges are `[start, end]` with BOTH ends inclusive. Adjacent ranges are: range[i].end+1 = range[i+1].start
 5. **Empty Hashes**: Check for EmptyCodeHash (0xc5d2...) and EmptyRootHash (0x56e8...) to skip unnecessary requests
 
 ### Key File References
